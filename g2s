@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec /home/smd/Documents/garmin_to_sundcup/.venv/bin/python -m garmin_to_sundcup "$@"
