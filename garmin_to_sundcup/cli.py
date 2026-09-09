@@ -3,15 +3,48 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from datetime import date, datetime, timedelta
 
-from . import config
+from . import config, picker
 from .garmin import GarminActivity, GarminClient
 from .sundcup import ActivityType, Competition, SundCup, SundCupError
 
 EMOJI = re.compile(r"[^\wÆØÅæøå ]+", re.UNICODE)
+
+
+def warn(msg: str) -> None:
+    print(f"WARNING: {msg}", file=sys.stderr)
+
+
+def check_stale(gc: GarminClient, day: date, cfg: dict) -> None:
+    """Warn if Garmin's cloud data for today lags behind the wall clock.
+
+    Garmin only has what the watch has uploaded, so a stale watermark means we
+    would log a step count the user can already see is too low on their watch.
+    """
+    if day != date.today():
+        return
+    limit = int(cfg["stale_after_minutes"])
+    if limit <= 0:
+        return
+    try:
+        last = gc.last_sample(day)
+    except Exception:
+        return
+    if last is None:
+        warn(f"Garmin has no step data yet for {day} - sync your watch")
+        return
+    lag = datetime.now() - last
+    if lag > timedelta(minutes=limit):
+        hours, minutes = divmod(int(lag.total_seconds()) // 60, 60)
+        warn(
+            f"Garmin's newest data is from {last:%H:%M} "
+            f"({hours}h{minutes:02d}m ago) - sync your watch, "
+            f"today's step count is probably too low"
+        )
 
 
 def _norm(name: str) -> str:
@@ -55,6 +88,60 @@ def describe(
     )
 
 
+def choose_activities(acts: list[GarminActivity], cfg: dict, args, state: dict) -> list[GarminActivity]:
+    """Narrow `acts` down to the ones to upload, remembering the answers.
+
+    An activity the user unticks is written to state["skipped"], so it stays
+    unticked (and, when running non-interactively, stays skipped) forever after.
+    Anything Garmin has not shown us before starts out ticked.
+    """
+    pending = []
+    for a in acts:
+        if not args.force and a.id in state["activities"]:
+            print(f"skip (already logged): {describe(a)}")
+        else:
+            pending.append(a)
+    if not pending:
+        return []
+
+    want_pick = args.pick if args.pick is not None else bool(cfg["pick"])
+    if not (want_pick and sys.stdin.isatty() and sys.stdout.isatty()):
+        keep = [a for a in pending if a.id not in state["skipped"]]
+        for a in pending:
+            if a.id in state["skipped"]:
+                print(f"skip (remembered): {describe(a)}")
+        return keep
+
+    choices = [
+        picker.Choice(
+            label=describe(a),
+            selected=a.id not in state["skipped"],
+            hint="tidligere fravalgt" if a.id in state["skipped"] else "",
+        )
+        for a in pending
+    ]
+    result = picker.select(
+        "Vaelg aktiviteter (mellemrum = til/fra, a = alle, n = ingen, enter = ok, q = fortryd):",
+        choices,
+    )
+    if result is None:
+        sys.exit("cancelled")
+
+    keep = []
+    for a, choice in zip(pending, result):
+        if choice.selected:
+            state["skipped"].pop(a.id, None)
+            keep.append(a)
+        else:
+            state["skipped"][a.id] = {
+                "start": a.start.isoformat(),
+                "type": a.sundcup_type,
+                "name": a.name,
+            }
+            print(f"skip (deselected): {describe(a)}")
+    return keep
+
+
 def push_activity(
     sc: SundCup,
     comp: Competition,
@@ -63,10 +150,6 @@ def push_activity(
     args,
     state: dict,
 ) -> bool:
-    if not args.force and a.id in state["activities"]:
-        print(f"skip (already logged): {describe(a)}")
-        return False
-
     oldest = date.today() - timedelta(days=comp.entry_window_days - 1)
     if not args.ignore_window:
         if a.start.date() < oldest:
@@ -110,7 +193,9 @@ def push_activity(
     return True
 
 
-def push_steps(gc: GarminClient, sc: SundCup, comp: Competition, day: date, args, state: dict) -> bool:
+def push_steps(gc: GarminClient, sc: SundCup, comp: Competition, day: date, args, cfg: dict,
+               state: dict) -> bool:
+    check_stale(gc, day, cfg)
     steps = gc.steps(day)
     if steps is None:
         print(f"{day}: no step data from Garmin")
@@ -148,10 +233,13 @@ def cmd_status(cfg, args) -> None:
     last = gc.last_activity()
     print(f"Garmin   : {describe(last) if last else 'no activities'}")
     today = date.today()
-    print(f"Skridt   : {gc.steps(today)} i dag ({today})")
+    last_sample = gc.last_sample(today)
+    print(f"Skridt   : {gc.steps(today)} i dag ({today})"
+          + (f", nyeste data {last_sample:%H:%M}" if last_sample else ""))
     print("Typer    : " + ", ".join(
         f"{t.label} ({t.base_points}/{t.unit})" for t in sc.activity_types(comp.id)
     ))
+    check_stale(gc, today, cfg)
 
 
 def cmd_sync(cfg, args) -> None:
@@ -159,6 +247,11 @@ def cmd_sync(cfg, args) -> None:
     sc, comp = connect_sundcup(cfg)
     state = config.load_state()
     changed = False
+
+    if args.forget_skips:
+        print(f"forgetting {len(state['skipped'])} remembered deselection(s)")
+        state["skipped"] = {}
+        changed = True
 
     if comp.status != "Active" and not (args.dry_run or args.ignore_window):
         sys.exit(f"Competition {comp.name!r} is {comp.status}, not Active - "
@@ -174,15 +267,18 @@ def cmd_sync(cfg, args) -> None:
             acts = [last] if last else []
         if not acts:
             print("No Garmin activities found")
+        before = json.dumps(state["skipped"], sort_keys=True)
+        acts = choose_activities(acts, cfg, args, state)
+        changed |= json.dumps(state["skipped"], sort_keys=True) != before
         for a in acts:
             changed |= push_activity(sc, comp, a, cfg, args, state)
 
     if not args.activity_only:
         days = [date.today() - timedelta(days=i) for i in range(args.step_days)]
         for day in sorted(days):
-            changed |= push_steps(gc, sc, comp, day, args, state)
+            changed |= push_steps(gc, sc, comp, day, args, cfg, state)
 
-    if changed:
+    if changed and not args.dry_run:  # a dry run never touches the state file
         config.save_state(state)
 
 
@@ -209,6 +305,12 @@ def main(argv: list[str] | None = None) -> None:
                         help="sync all Garmin activities from the last N days instead of just the latest")
         sp.add_argument("--step-days", type=int, default=1, metavar="N",
                         help="how many days of steps to sync (default 1 = today)")
+        sp.add_argument("--pick", dest="pick", action="store_true", default=None,
+                        help="tick which activities to upload (default when interactive)")
+        sp.add_argument("--no-pick", dest="pick", action="store_false",
+                        help="upload everything not previously deselected")
+        sp.add_argument("--forget-skips", action="store_true",
+                        help="clear the remembered deselections and start over")
         sp.add_argument("--activity-only", action="store_true")
         sp.add_argument("--steps-only", action="store_true")
         sp.add_argument("--ignore-window", action="store_true",

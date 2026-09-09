@@ -15,7 +15,7 @@ Garmin session tokens are cached in `~/.config/garmin_to_sundcup/garth`, so the
 password (and any MFA code) is normally only needed once.
 
 Config: `~/.config/garmin_to_sundcup/config.toml` (email, Sund Cup username,
-default visibility, note template).
+default visibility, note template, `pick`, `stale_after_minutes`).
 The site serves an incomplete cert chain, so `certs/sundcup-ca-bundle.pem`
 (certifi + the DigiCert EU intermediate) is used for TLS verification.
 
@@ -37,6 +37,40 @@ Flags: `--force` (re-log despite dedupe), `--visibility Public|TeamOnly`,
 Already-logged Garmin activity ids are remembered in
 `~/.local/state/garmin_to_sundcup/synced.json`; steps are upserted, so
 re-running is safe.
+
+### Picking activities
+
+Run interactively and you get a checkbox list before anything is uploaded:
+
+```
+Vaelg aktiviteter (mellemrum = til/fra, a = alle, n = ingen, enter = ok, q = fortryd):
+>[ ] 2026-09-09 06:38  Løb        31 min   5.40 km  ude   Morning run [running]   tidligere fravalgt
+ [x] 2026-09-09 07:12  Cykling    22 min   8.10 km  ude   Ride to work [cycling]
+```
+
+Arrow keys (or `j`/`k`) move, space toggles, enter uploads the ticked ones.
+Whatever you untick is remembered in the `skipped` section of the state file:
+that activity stays unticked next time and is never uploaded, while anything
+new — tomorrow's swim — turns up ticked by default, ready for you to untick if
+you want. Re-ticking an activity forgets the deselection.
+
+Deselections are also honoured non-interactively, so the systemd timer below
+will not upload a run you said no to. Options: `--no-pick` (upload everything
+not previously deselected), `--pick` (force the list on), `pick = false` in
+`config.toml` (turn the default off), `--forget-skips` (clear the memory).
+A dry run never writes to the state file.
+
+### Stale Garmin data
+
+Garmin's cloud only holds what your watch has uploaded. If the newest step
+sample is more than `stale_after_minutes` old (default 120), you get a warning
+on stderr before the steps are logged, because the count is probably too low:
+
+```
+WARNING: Garmin's newest data is from 18:01 (3h25m ago) - sync your watch, today's step count is probably too low
+```
+
+`./g2s status` also prints the time of the newest sample.
 
 ## Notes
 
@@ -61,7 +95,7 @@ cat > ~/.config/systemd/user/g2s.service <<'EOF'
 Description=Sync Garmin to Sund Cup
 [Service]
 Type=oneshot
-ExecStart=/home/smd/Documents/garmin_to_sundcup/g2s --since-days 2 --step-days 2
+ExecStart=/home/smd/Documents/garmin_to_sundcup/g2s --since-days 2 --step-days 2 --no-pick
 EOF
 cat > ~/.config/systemd/user/g2s.timer <<'EOF'
 [Unit]

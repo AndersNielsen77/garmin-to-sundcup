@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from garminconnect import Garmin
 
@@ -186,6 +186,19 @@ class GarminClient:
     def activities_since(self, day: date, limit: int = 20) -> list[GarminActivity]:
         acts = [to_activity(a) for a in self.connect().get_activities(0, limit)]
         return [a for a in acts if a.start.date() >= day]
+
+    def last_sample(self, day: date) -> datetime | None:
+        """Local end time of the newest intraday step bucket Garmin holds for `day`.
+
+        Buckets only exist up to the point the watch last uploaded, so this is
+        an upload watermark: if it lags far behind now, the cloud is stale.
+        """
+        buckets = self.connect().get_steps_data(day.isoformat()) or []
+        ends = [b["endGMT"] for b in buckets if b.get("endGMT")]
+        if not ends:
+            return None
+        end = datetime.strptime(max(ends).split(".")[0], "%Y-%m-%dT%H:%M:%S")
+        return end.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
 
     def steps(self, day: date) -> int | None:
         stats = self.connect().get_stats(day.isoformat()) or {}

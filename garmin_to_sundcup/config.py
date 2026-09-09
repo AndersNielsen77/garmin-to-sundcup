@@ -26,6 +26,10 @@ DEFAULTS = {
     "ca_bundle": str(PROJECT_DIR / "certs" / "sundcup-ca-bundle.pem"),
     "visibility": "TeamOnly",
     "note_template": "{name} (Garmin)",
+    # Warn when Garmin's cloud has no step data newer than this many minutes.
+    "stale_after_minutes": 120,
+    # Ask which activities to upload when running interactively.
+    "pick": True,
 }
 
 
@@ -75,9 +79,10 @@ def clear_password(kind: str, account: str) -> None:
 
 
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"activities": {}, "steps": {}}
+    state = json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    for key in ("activities", "steps", "skipped"):
+        state.setdefault(key, {})
+    return state
 
 
 def save_state(state: dict) -> None:
